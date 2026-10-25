@@ -121,9 +121,17 @@ final class AppModel: ObservableObject {
 
     func allowHost(projectID: UUID, host: String) {
         guard var project = projects.first(where: { $0.id == projectID }) else { return }
-        let host = HostSafety.normalize(host)
+        let host = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !project.allowedHosts.contains(host) {
             project.allowedHosts.append(host)
+            update(project)
+        }
+    }
+
+    func allowGitHubRepo(projectID: UUID, repo: String) {
+        guard var project = projects.first(where: { $0.id == projectID }) else { return }
+        if !project.allowedGitHubRepos.contains(repo) {
+            project.allowedGitHubRepos.append(repo)
             update(project)
         }
     }

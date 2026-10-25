@@ -24,6 +24,8 @@ struct MeridianChecks {
             try mirror()
             try await modelGateway()
             try await githubTool()
+            try await githubDenied()
+            try await grant()
             print("ok")
         } catch {
             fputs("\(error)\n", stderr)
@@ -34,8 +36,14 @@ struct MeridianChecks {
     static func policy() throws {
         try check(SensitivePath.verdict(relativePath: ".env") == .envFile)
         try check(SensitivePath.verdict(relativePath: "config/.env.local") == .envFile)
+        try check(SensitivePath.verdict(relativePath: ".envrc") == .credentialFile)
         try check(SensitivePath.verdict(relativePath: ".ssh/id_rsa") == .secretDirectory)
+        try check(SensitivePath.verdict(relativePath: ".git/hooks/pre-commit") == .credentialFile)
+        try check(SensitivePath.verdict(relativePath: ".git/config") == .credentialFile)
+        try check(SensitivePath.verdict(relativePath: ".husky/pre-commit") == .secretDirectory)
+        try check(SensitivePath.verdict(relativePath: ".docker/config.json") == .secretDirectory)
         try check(SensitivePath.verdict(relativePath: "keys/server.pem") == .privateKey)
+        try check(SensitivePath.verdict(relativePath: "id_ed25519_sk") == .privateKey)
         try check(SensitivePath.verdict(relativePath: "credentials.json") == .credentialFile)
         try check(SensitivePath.verdict(relativePath: "README.md") == nil)
         try check(SensitivePath.verdict(relativePath: "../.ssh/id_rsa") == .escapesProject)
@@ -47,14 +55,29 @@ struct MeridianChecks {
         try check(HostSafety.isObviouslyInternal("localhost"))
         try check(HostSafety.isObviouslyInternal("printer.local"))
         try check(HostSafety.isObviouslyInternal("::1"))
+        try check(HostSafety.isObviouslyInternal("::ffff:10.1.2.3"))
+        try check(HostSafety.isObviouslyInternal("::10.1.2.3"))
+        try check(HostSafety.isObviouslyInternal("2002:0a00:0001::"))
+        try check(HostSafety.isObviouslyInternal("64:ff9b::10.0.0.1"))
         try check(!HostSafety.isObviouslyInternal("8.8.8.8"))
         try check(!HostSafety.isObviouslyInternal("github.com"))
+        try check(!HostSafety.isObviouslyInternal("2002:0808:0808::"))
         let policy = NetworkPolicy(allowedHosts: ["api.anthropic.com"], gitHubEnabled: true)
         if case .deny = policy.decide(host: "api.anthropic.com", port: 443) {} else { try check(false, "模型域名必须拒绝") }
         if case .deny = policy.decide(host: "API.OpenAI.com", port: 443) {} else { try check(false, "模型域名必须拒绝") }
         try check(policy.decide(host: "github.com", port: 443) == .allow)
         if case .ask = policy.decide(host: "registry.npmjs.org", port: 443) {} else { try check(false, "未知网站应该询问") }
         if case .deny = policy.decide(host: "192.168.0.5", port: 443) {} else { try check(false, "内网必须拒绝") }
+        let suffix = NetworkPolicy(allowedHosts: ["com"])
+        if case .ask = suffix.decide(host: "evil.com", port: 443) {} else { try check(false, "不能用后缀放行整个 com") }
+        let session = NetworkPolicy(sessionEndpoints: ["registry.npmjs.org:443"])
+        try check(session.decide(host: "registry.npmjs.org", port: 443) == .allow)
+        if case .ask = session.decide(host: "registry.npmjs.org", port: 22) {} else { try check(false, "会话放行必须带端口") }
+        try check(hostMatches("objects.githubusercontent.com", rule: "githubusercontent.com"))
+        try check(!hostMatches("evil.foo.github.com", rule: "github.com"))
+        try check(!GitHubName.isName(".."))
+        try check(!GitHubName.isName("."))
+        try check(GitHubName.isName("octocat"))
     }
 
     static func frame() throws {
@@ -86,10 +109,18 @@ struct MeridianChecks {
         try check(!request.headers.contains { $0.1.contains("sk-attacker") || $0.1.contains("meridian-local") })
         try check(CredentialRewriter.upstreamURL(provider: .anthropic, target: "/v1/messages")?.absoluteString == "https://api.anthropic.com/v1/messages")
         try check(GitHubRoutes.gitURL(target: "/github/octo/repo.git/info/refs?service=git-upload-pack")?.absoluteString == "https://github.com/octo/repo.git/info/refs?service=git-upload-pack")
-        try check(GitHubRoutes.gitURL(target: "https://evil.example/github/octo/repo.git")?.host == "github.com")
+        try check(GitHubRoutes.gitURL(target: "https://evil.example/github/octo/repo.git/info/refs?service=git-upload-pack")?.host == "github.com")
+        try check(GitHubRoutes.gitURL(target: "https://evil.example/github/octo/repo.git") == nil)
+        try check(GitHubRoutes.gitURL(target: "/github/octo/repo.git/settings") == nil)
+        try check(GitHubRoutes.gitURL(target: "/github/octo/repo.git/git-upload-pack", method: "DELETE") == nil)
+        try check(GitHubRoutes.gitURL(target: "/github/octo/repo.git/git-upload-pack", method: "POST")?.host == "github.com")
         try check(GitHubRoutes.gitURL(target: "/v1/messages") == nil)
+        try check(CredentialRewriter.allows(provider: .anthropic, method: "POST", target: "/v1/messages"))
+        try check(!CredentialRewriter.allows(provider: .anthropic, method: "DELETE", target: "/v1/messages"))
+        try check(!CredentialRewriter.allows(provider: .anthropic, method: "POST", target: "/v1/admin"))
         let note = Redaction.redact(CredentialRewriter.attachmentNote(provider: .anthropic), secrets: ["sk-real-host-key"])
         try check(!note.contains("sk-real-host-key"))
+        try check(!Redaction.redact("key=ab", secrets: ["ab"]).contains("ab"))
     }
 
     static func placeholder() throws {
@@ -135,6 +166,11 @@ struct MeridianChecks {
         try check(stat(project.appendingPathComponent("README.md").path, &source) == 0)
         try check(stat(mirror.appendingPathComponent("README.md").path, &linked) == 0)
         try check(source.st_ino == linked.st_ino)
+        try FileManager.default.createDirectory(at: project.appendingPathComponent(".git/hooks"), withIntermediateDirectories: true)
+        try Data("evil".utf8).write(to: project.appendingPathComponent(".git/hooks/pre-commit"))
+        try box.rebuild()
+        try check(!FileManager.default.fileExists(atPath: mirror.appendingPathComponent(".git/hooks/pre-commit").path))
+        try check(box.blocked.contains { $0.path == ".git/hooks/pre-commit" || $0.path == ".git/hooks" })
         let created = mirror.appendingPathComponent("note.txt")
         try Data("from guest".utf8).write(to: created)
         box.accept(absolutePath: created.path, removed: false)
@@ -178,7 +214,7 @@ struct MeridianChecks {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [StubURL.self]
         let session = URLSession(configuration: config)
-        let gateway = GitHubGateway(session: session, token: { token }, authorize: { _ in true })
+        let gateway = GitHubGateway(session: session, token: { token }, authorize: { _ in .session })
         let body = Data("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"github_whoami\",\"arguments\":{}}}".utf8)
         var raw = Data("POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
         raw.append(body)
@@ -193,6 +229,100 @@ struct MeridianChecks {
         try check(text.contains("octocat"))
         try check(!text.contains(token))
         try check(StubURL.last?.value(forHTTPHeaderField: "Authorization") == "Bearer \(token)")
+    }
+
+    static func githubDenied() async throws {
+        let token = "ghp_secret_value"
+        StubURL.last = nil
+        StubURL.body = Data("{\"login\":\"octocat\"}".utf8)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubURL.self]
+        let session = URLSession(configuration: config)
+        let gateway = GitHubGateway(session: session, token: { token }, authorize: { _ in .deny })
+        let body = Data("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"github_whoami\",\"arguments\":{}}}".utf8)
+        var raw = Data("POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
+        raw.append(body)
+        let reader = BufferReader()
+        reader.append(raw)
+        reader.finish()
+        var written = Data()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            gateway.serveMCP(reader: reader, writer: { written.append($0) }, close: { continuation.resume() })
+        }
+        let text = String(data: written, encoding: .utf8) ?? ""
+        try check(text.contains("403") || text.contains("没有允许"))
+        try check(StubURL.last == nil)
+        try check(!text.contains(token))
+    }
+
+    static func grant() async throws {
+        let token = "ghp_secret_value"
+        actor Grants {
+            var values: [AccessGrant] = [.once, .deny]
+            func next() -> AccessGrant {
+                guard !values.isEmpty else { return .deny }
+                return values.removeFirst()
+            }
+        }
+        let grants = Grants()
+        StubURL.last = nil
+        StubURL.body = Data("{\"login\":\"octocat\"}".utf8)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubURL.self]
+        let session = URLSession(configuration: config)
+        let gateway = GitHubGateway(session: session, token: { token }, authorize: { _ in await grants.next() })
+        func call() async -> String {
+            let body = Data("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"github_whoami\",\"arguments\":{}}}".utf8)
+            var raw = Data("POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
+            raw.append(body)
+            let reader = BufferReader()
+            reader.append(raw)
+            reader.finish()
+            var written = Data()
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                gateway.serveMCP(reader: reader, writer: { written.append($0) }, close: { continuation.resume() })
+            }
+            return String(data: written, encoding: .utf8) ?? ""
+        }
+        let first = await call()
+        try check(first.contains("octocat"))
+        StubURL.last = nil
+        let second = await call()
+        try check(second.contains("403") || second.contains("没有允许"))
+        try check(StubURL.last == nil)
+
+        actor SessionGrants {
+            var remaining: [AccessGrant] = [.session, .deny]
+            var asked = 0
+            func next() -> AccessGrant {
+                asked += 1
+                guard !remaining.isEmpty else { return .deny }
+                return remaining.removeFirst()
+            }
+            func count() -> Int { asked }
+        }
+        let sessionGrants = SessionGrants()
+        StubURL.last = nil
+        let kept = GitHubGateway(session: session, token: { token }, authorize: { _ in await sessionGrants.next() })
+        func callKept() async -> String {
+            let body = Data("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"github_whoami\",\"arguments\":{}}}".utf8)
+            var raw = Data("POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n".utf8)
+            raw.append(body)
+            let reader = BufferReader()
+            reader.append(raw)
+            reader.finish()
+            var written = Data()
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                kept.serveMCP(reader: reader, writer: { written.append($0) }, close: { continuation.resume() })
+            }
+            return String(data: written, encoding: .utf8) ?? ""
+        }
+        let keptFirst = await callKept()
+        let keptSecond = await callKept()
+        let asked = await sessionGrants.count()
+        try check(keptFirst.contains("octocat"))
+        try check(keptSecond.contains("octocat"))
+        try check(asked == 1)
     }
 }
 

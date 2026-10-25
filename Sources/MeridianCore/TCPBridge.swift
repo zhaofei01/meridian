@@ -3,13 +3,17 @@ import Foundation
 
 public enum TCPBridge {
     public static func run(host: String, port: Int, reader: BufferReader, writer: @escaping (Data) -> Void, close: @escaping () -> Void) {
-        guard !HostSafety.isObviouslyInternal(host), HostSafety.resolvesToPublicInternet(host) else {
+        guard let endpoints = HostSafety.resolvePublic(host: host, port: port) else {
             close()
             return
         }
+        run(endpoints: endpoints, reader: reader, writer: writer, close: close)
+    }
+
+    public static func run(endpoints: [PublicEndpoint], reader: BufferReader, writer: @escaping (Data) -> Void, close: @escaping () -> Void) {
         let fd: Int32
         do {
-            fd = try connect(host: host, port: port)
+            fd = try connect(endpoints: endpoints)
         } catch {
             close()
             return
@@ -49,26 +53,25 @@ public enum TCPBridge {
         }
     }
 
-    static func connect(host: String, port: Int) throws -> Int32 {
-        var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
-        hints.ai_socktype = SOCK_STREAM
-        var info: UnsafeMutablePointer<addrinfo>?
-        let rc = getaddrinfo(host, String(port), &hints, &info)
-        guard rc == 0, let info else { throw POSIXError(.EHOSTUNREACH) }
-        defer { freeaddrinfo(info) }
-        var cursor: UnsafeMutablePointer<addrinfo>? = info
+    static func connect(endpoints: [PublicEndpoint]) throws -> Int32 {
         var lastError = errno
-        while let node = cursor {
-            let fd = socket(node.pointee.ai_family, node.pointee.ai_socktype, node.pointee.ai_protocol)
-            if fd >= 0 {
-                if Darwin.connect(fd, node.pointee.ai_addr, node.pointee.ai_addrlen) == 0 {
-                    return fd
-                }
+        for endpoint in endpoints {
+            let fd = socket(endpoint.family, endpoint.socktype, endpoint.proto)
+            guard fd >= 0 else {
                 lastError = errno
-                Darwin.close(fd)
+                continue
             }
-            cursor = node.pointee.ai_next
+            var timeout = timeval(tv_sec: 15, tv_usec: 0)
+            _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            let connected = endpoint.address.withUnsafeBytes { raw -> Bool in
+                guard let base = raw.bindMemory(to: sockaddr.self).baseAddress else { return false }
+                return Darwin.connect(fd, base, socklen_t(endpoint.address.count)) == 0
+            }
+            if connected {
+                return fd
+            }
+            lastError = errno
+            Darwin.close(fd)
         }
         throw POSIXError(POSIXErrorCode(rawValue: lastError) ?? .ECONNREFUSED)
     }

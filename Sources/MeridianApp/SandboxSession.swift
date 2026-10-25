@@ -51,7 +51,10 @@ final class SandboxSession: ObservableObject {
     private var terminalFeed: ((Data) -> Void)?
     private var cols = 100
     private var rows = 32
-    private var sessionAllows: Set<String> = []
+    private var sessionEndpoints: Set<String> = []
+    var startWhenImageReady = false
+    @Published private(set) var hasClaude = false
+    @Published private(set) var hasCodex = false
     private var readyContinuation: CheckedContinuation<StreamOpen, Error>?
     private var readySettled = false
     private var timeoutTask: Task<Void, Never>?
@@ -77,26 +80,36 @@ final class SandboxSession: ObservableObject {
 
     func start() {
         guard phase == .idle || phase.isFailed else { return }
-        Task { await self.boot() }
+        Task {
+            await self.disposeResources()
+            await self.boot()
+        }
     }
 
     func stop() {
         guard phase == .starting || phase == .running else { return }
         phase = .stopping
+        Task {
+            await self.disposeResources()
+            self.phase = .idle
+            self.shellRunning = false
+            self.statusLine = "沙箱已关闭"
+        }
+    }
+
+    private func disposeResources() async {
         timeoutTask?.cancel()
         finishReady(.failure(SessionError.bootTimeout))
         let channel = self.channel
         let vm = self.vm
         let mirror = self.mirror
         self.channel = nil
-        Task {
-            channel?.close()
-            await vm?.stop()
-            mirror?.stop()
-            self.phase = .idle
-            self.shellRunning = false
-            self.statusLine = "沙箱已关闭"
-        }
+        self.vm = nil
+        self.mirror = nil
+        channel?.close()
+        await vm?.stop()
+        mirror?.stop()
+        shellRunning = false
     }
 
     func launch(_ tool: AgentTool) {
@@ -146,7 +159,7 @@ final class SandboxSession: ObservableObject {
             } else {
                 model.note(projectID: projectID, level: .deny, message: "留在外面：\(names.joined(separator: "、"))")
             }
-            installGateways(gitHub: project.gitHubEnabled)
+            installGateways()
             let vm = LinuxVM(
                 projectID: projectID,
                 kernel: image.kernel,
@@ -166,6 +179,7 @@ final class SandboxSession: ObservableObject {
             vm.onStopped = { [weak self] message in
                 Task { @MainActor in
                     guard let self, self.phase == .running || self.phase == .starting else { return }
+                    await self.disposeResources()
                     self.phase = .failed(message ?? "沙箱停了。")
                     self.shellRunning = false
                 }
@@ -231,18 +245,18 @@ final class SandboxSession: ObservableObject {
             workspaceMounted = hello.workspace == true
             phase = .running
             statusLine = workspaceMounted ? "沙箱内没有密钥" : "沙箱已打开，项目目录没有挂上"
+            hasClaude = image.manifest.hasClaude
+            hasCodex = image.manifest.hasCodex
             var tools: [String] = []
-            if image.manifest.hasClaude { tools.append("Claude Code") }
-            if image.manifest.hasCodex { tools.append("Codex") }
+            if hasClaude { tools.append("Claude Code") }
+            if hasCodex { tools.append("Codex") }
             toolNote = tools.isEmpty ? "这间沙箱里目前有终端。重新准备系统后可以带上 Claude Code 和 Codex。" : "可以打开 \(tools.joined(separator: "、"))。"
             model.note(projectID: projectID, level: .allow, message: statusLine)
         } catch {
-            timeoutTask?.cancel()
+            await disposeResources()
             phase = .failed(explain(error))
             statusLine = explain(error)
             model.note(projectID: projectID, level: .deny, message: statusLine)
-            channel?.close()
-            await vm?.stop()
         }
     }
 
@@ -254,7 +268,7 @@ final class SandboxSession: ObservableObject {
         continuation.resume(with: result)
     }
 
-    private func installGateways(gitHub: Bool) {
+    private func installGateways() {
         let secrets = model.secrets
         let projectID = projectID
         anthropic = ModelGateway(provider: .anthropic, secret: {
@@ -270,12 +284,22 @@ final class SandboxSession: ObservableObject {
         github = GitHubGateway(token: {
             try? secrets.load(account: "github")
         }, authorize: { [weak self] detail in
-            guard let self else { return false }
-            return await self.model.ask(projectID: projectID, title: "使用 GitHub", detail: detail)
+            guard let self else { return .deny }
+            let choice = await self.model.askChoice(projectID: projectID, title: "使用 GitHub", detail: detail)
+            switch choice {
+            case .once: return .once
+            case .session: return .session
+            case .always: return .always
+            case .deny: return .deny
+            }
+        }, knownRepos: { [weak self] in
+            guard let self else { return [] }
+            return Set(self.model.projects.first { $0.id == projectID }?.allowedGitHubRepos ?? [])
+        }, persistRepo: { [weak self] repo in
+            self?.model.allowGitHubRepo(projectID: projectID, repo: repo)
         }, log: { [weak self] message in
             Task { @MainActor in self?.model.note(projectID: projectID, level: .allow, message: message) }
         })
-        _ = gitHub
     }
 
     private func route(_ open: StreamOpen, reader: BufferReader, writer: @escaping (Data) -> Void, close: @escaping () -> Void) {
@@ -312,13 +336,13 @@ final class SandboxSession: ObservableObject {
         close: @escaping () -> Void,
         accept: @escaping () -> Void
     ) async {
-        guard var project = model.projects.first(where: { $0.id == projectID }) else {
+        guard let project = model.projects.first(where: { $0.id == projectID }) else {
             close()
             return
         }
         let policy = NetworkPolicy(
             allowedHosts: Set(project.allowedHosts),
-            sessionHosts: sessionAllows,
+            sessionEndpoints: sessionEndpoints,
             gitHubEnabled: project.gitHubEnabled
         )
         let decision = policy.decide(host: host, port: port)
@@ -327,14 +351,7 @@ final class SandboxSession: ObservableObject {
             model.note(projectID: projectID, level: .deny, message: message)
             close()
         case .allow:
-            guard HostSafety.resolvesToPublicInternet(host) else {
-                model.note(projectID: projectID, level: .deny, message: "拒绝联系 \(host)。地址落在内部网络。")
-                close()
-                return
-            }
-            model.note(projectID: projectID, level: .allow, message: "允许联系 \(host)。")
-            accept()
-            TCPBridge.run(host: host, port: port, reader: reader, writer: writer, close: close)
+            connectPublic(host: host, port: port, reader: reader, writer: writer, close: close, accept: accept)
         case .ask(let message):
             let choice = await model.askChoice(projectID: projectID, title: "联系外面", detail: message)
             guard choice != .deny else {
@@ -342,22 +359,33 @@ final class SandboxSession: ObservableObject {
                 close()
                 return
             }
+            let key = NetworkPolicy.endpointKey(host: host, port: port)
             if choice == .session {
-                sessionAllows.insert(HostSafety.normalize(host))
+                sessionEndpoints.insert(key)
             }
             if choice == .always {
-                model.allowHost(projectID: projectID, host: host)
-                project.allowedHosts.append(HostSafety.normalize(host))
+                model.allowHost(projectID: projectID, host: key)
             }
-            guard HostSafety.resolvesToPublicInternet(host) else {
-                model.note(projectID: projectID, level: .deny, message: "拒绝联系 \(host)。地址落在内部网络。")
-                close()
-                return
-            }
-            model.note(projectID: projectID, level: .allow, message: "允许联系 \(host)。")
-            accept()
-            TCPBridge.run(host: host, port: port, reader: reader, writer: writer, close: close)
+            connectPublic(host: host, port: port, reader: reader, writer: writer, close: close, accept: accept)
         }
+    }
+
+    private func connectPublic(
+        host: String,
+        port: Int,
+        reader: BufferReader,
+        writer: @escaping (Data) -> Void,
+        close: @escaping () -> Void,
+        accept: @escaping () -> Void
+    ) {
+        guard let endpoints = HostSafety.resolvePublic(host: host, port: port) else {
+            model.note(projectID: projectID, level: .deny, message: "拒绝联系 \(host)。地址落在内部网络。")
+            close()
+            return
+        }
+        model.note(projectID: projectID, level: .allow, message: "允许联系 \(host)。")
+        accept()
+        TCPBridge.run(endpoints: endpoints, reader: reader, writer: writer, close: close)
     }
 
     private func explain(_ error: Error) -> String {

@@ -40,6 +40,31 @@ public struct HTTPRequest {
     }
 }
 
+public enum HTTPHeader {
+    public static let modelForward: Set<String> = [
+        "content-type", "accept", "user-agent",
+        "authorization", "x-api-key",
+        "anthropic-version", "anthropic-beta",
+        "openai-beta",
+    ]
+
+    public static let gitForward: Set<String> = [
+        "content-type", "accept", "git-protocol",
+    ]
+
+    public static func isSafe(name: String, value: String) -> Bool {
+        !name.isEmpty
+            && !name.contains(where: { $0 == "\r" || $0 == "\n" || $0 == ":" })
+            && !value.contains(where: { $0 == "\r" || $0 == "\n" })
+    }
+
+    public static func allowed(_ headers: [(String, String)], names: Set<String>) -> [(String, String)] {
+        headers.filter { name, value in
+            names.contains(name.lowercased()) && isSafe(name: name, value: value)
+        }
+    }
+}
+
 public enum HTTPError: Error, Equatable {
     case malformed
     case tooLarge
@@ -71,6 +96,7 @@ public enum HTTPCodec {
             guard let colon = line.firstIndex(of: ":") else { throw HTTPError.malformed }
             let name = String(line[..<colon]).trimmingCharacters(in: .whitespaces)
             let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            guard HTTPHeader.isSafe(name: name, value: value) else { throw HTTPError.malformed }
             headers.append((name, value))
         }
         var request = HTTPRequest(method: parts[0], target: parts[1], version: parts[2], headers: headers)
