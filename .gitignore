@@ -4,3 +4,5 @@ dist/
 .DS_Store
 *.dmg
 GuestImage/
+__pycache__/
+*.pyc
