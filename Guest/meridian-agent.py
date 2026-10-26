@@ -28,6 +28,16 @@ FLAG_CLOSE = 4
 FLAG_HELLO = 8
 FLAG_RESIZE = 16
 ALLOWED = {"claude", "codex", "bash", "sh"}
+WORKSPACE = "/workspace"
+
+
+def under_workspace(path):
+    try:
+        real = os.path.realpath(path)
+        root = os.path.realpath(WORKSPACE)
+        return real == root or real.startswith(root + os.sep)
+    except OSError:
+        return False
 
 
 def pack_frame(stream_id, flags, payload):
@@ -159,7 +169,7 @@ class Shell:
     def run(self):
         argv = resolve_argv(self.info.get("argv") or ["bash"])
         cwd = self.info.get("cwd") or "/workspace"
-        if not cwd.startswith("/workspace"):
+        if not under_workspace(cwd):
             cwd = "/workspace"
         if not os.path.isdir(cwd):
             cwd = "/"

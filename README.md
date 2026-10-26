@@ -19,7 +19,7 @@ make run
 
 也可以先 `make run`，在窗口里点「准备沙箱系统」。
 
-`make dmg` 会生成 `dist/Meridian.dmg`，给别人安装。对方打开后把 Meridian 拖进「应用程序」。
+`make dmg` 会生成 `dist/Meridian.dmg`。这是本机 Release 构建，用临时签名；别人安装时系统可能提醒未公证。
 
 ## 使用
 

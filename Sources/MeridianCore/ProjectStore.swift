@@ -7,6 +7,11 @@ public struct ProjectRecord: Codable, Identifiable, Equatable {
     public var createdAt: Date
     public var gitHubEnabled: Bool
     public var allowedHosts: [String]
+    public var allowedGitHubRepos: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, path, createdAt, gitHubEnabled, allowedHosts, allowedGitHubRepos
+    }
 
     public init(
         id: UUID = UUID(),
@@ -14,7 +19,8 @@ public struct ProjectRecord: Codable, Identifiable, Equatable {
         path: String,
         createdAt: Date = Date(),
         gitHubEnabled: Bool = false,
-        allowedHosts: [String] = []
+        allowedHosts: [String] = [],
+        allowedGitHubRepos: [String] = []
     ) {
         self.id = id
         self.name = name
@@ -22,6 +28,18 @@ public struct ProjectRecord: Codable, Identifiable, Equatable {
         self.createdAt = createdAt
         self.gitHubEnabled = gitHubEnabled
         self.allowedHosts = allowedHosts
+        self.allowedGitHubRepos = allowedGitHubRepos
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        path = try container.decode(String.self, forKey: .path)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        gitHubEnabled = try container.decodeIfPresent(Bool.self, forKey: .gitHubEnabled) ?? false
+        allowedHosts = try container.decodeIfPresent([String].self, forKey: .allowedHosts) ?? []
+        allowedGitHubRepos = try container.decodeIfPresent([String].self, forKey: .allowedGitHubRepos) ?? []
     }
 }
 

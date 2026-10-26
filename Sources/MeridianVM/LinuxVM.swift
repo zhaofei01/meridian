@@ -65,14 +65,29 @@ public final class LinuxVM: NSObject, VZVirtualMachineDelegate {
     public func stop() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.queue.async {
-                guard let vm = self.machine, vm.canStop else {
-                    continuation.resume()
-                    return
-                }
-                vm.stop { _ in
-                    continuation.resume()
-                }
+                self.stopWhenPossible(tries: 0, continuation: continuation)
             }
+        }
+    }
+
+    private func stopWhenPossible(tries: Int, continuation: CheckedContinuation<Void, Never>) {
+        guard let vm = self.machine else {
+            continuation.resume()
+            return
+        }
+        if vm.canStop {
+            vm.stop { _ in
+                self.machine = nil
+                continuation.resume()
+            }
+            return
+        }
+        if tries >= 150 {
+            continuation.resume()
+            return
+        }
+        self.queue.asyncAfter(deadline: .now() + 0.1) {
+            self.stopWhenPossible(tries: tries + 1, continuation: continuation)
         }
     }
 

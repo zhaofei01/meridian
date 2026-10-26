@@ -14,7 +14,7 @@ public enum SecretMaterial {
 public enum Redaction {
     public static func redact(_ text: String, secrets: [String]) -> String {
         var result = text
-        for secret in secrets where secret.count >= 4 && secret != SecretMaterial.placeholder {
+        for secret in secrets where !secret.isEmpty && secret != SecretMaterial.placeholder {
             result = result.replacingOccurrences(of: secret, with: "•••")
         }
         return result

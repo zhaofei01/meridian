@@ -41,6 +41,12 @@ struct SandboxView: View {
         }
         .background(Theme.paper)
         .onDisappear { session.stop() }
+        .onChange(of: model.imagePhase) { _, phase in
+            if case .ready = phase, session.startWhenImageReady {
+                session.startWhenImageReady = false
+                session.start()
+            }
+        }
     }
 
     private var header: some View {
@@ -54,18 +60,22 @@ struct SandboxView: View {
             }
             Spacer()
             Button("Claude Code") { session.launch(.claude) }
-                .disabled(session.phase != .running)
+                .disabled(session.phase != .running || !hasClaude)
+                .help(hasClaude ? "在沙箱里打开 Claude Code" : "这套沙箱系统还没有 Claude Code")
             Button("Codex") { session.launch(.codex) }
-                .disabled(session.phase != .running)
+                .disabled(session.phase != .running || !hasCodex)
+                .help(hasCodex ? "在沙箱里打开 Codex" : "这套沙箱系统还没有 Codex")
             Button("终端") { session.launch(.shell) }
                 .disabled(session.phase != .running)
             if session.phase == .running || session.phase == .starting {
                 Button("关闭沙箱") { session.stop() }
+            } else if case .building = model.imagePhase {
+                Button("正在准备系统") {}
+                    .disabled(true)
             } else {
-                Button(session.phase == .starting ? "正在打开" : "打开沙箱") { begin() }
+                Button("打开沙箱") { begin() }
                     .buttonStyle(.borderedProminent)
                     .tint(Theme.line)
-                    .disabled(session.phase == .starting)
             }
         }
         .padding(.horizontal, 16)
@@ -139,16 +149,23 @@ struct SandboxView: View {
         }
     }
 
+    private var hasClaude: Bool {
+        if case .ready(let manifest) = model.imagePhase { return manifest.hasClaude }
+        return session.hasClaude
+    }
+
+    private var hasCodex: Bool {
+        if case .ready(let manifest) = model.imagePhase { return manifest.hasCodex }
+        return session.hasCodex
+    }
+
     private func begin() {
         if case .ready = model.imagePhase {
             session.start()
             return
         }
-        if case .missing = model.imagePhase {
-            model.prepareImage()
-        }
-        if case .failed = model.imagePhase {
-            model.prepareImage()
-        }
+        session.startWhenImageReady = true
+        if case .building = model.imagePhase { return }
+        model.prepareImage()
     }
 }

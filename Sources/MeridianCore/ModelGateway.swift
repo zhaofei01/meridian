@@ -37,7 +37,8 @@ public final class ModelGateway: @unchecked Sendable {
                 log("还没有连接 \(provider.displayName)，已拦住这次模型请求。")
                 return
             }
-            guard let url = CredentialRewriter.upstreamURL(provider: provider, target: request.target) else {
+            guard CredentialRewriter.allows(provider: provider, method: request.method, target: request.target),
+                  let url = CredentialRewriter.upstreamURL(provider: provider, target: request.target) else {
                 writer(HTTPCodec.response(status: 400, reason: "Bad Request", body: Data("无法转交这个请求。".utf8)))
                 return
             }
@@ -45,7 +46,7 @@ public final class ModelGateway: @unchecked Sendable {
             var upstream = URLRequest(url: url)
             upstream.httpMethod = request.method
             upstream.httpBody = request.body
-            for (name, value) in request.headers {
+            for (name, value) in HTTPHeader.allowed(request.headers, names: HTTPHeader.modelForward) {
                 upstream.setValue(value, forHTTPHeaderField: name)
             }
             let (bytes, response) = try await session.bytes(for: upstream)

@@ -51,6 +51,9 @@ public enum GuestImageStore {
               let manifest = try? JSONDecoder().decode(GuestImageManifest.self, from: data) else {
             return nil
         }
+        guard isSafeImageName(manifest.kernelName), isSafeImageName(manifest.initramfsName) else {
+            return nil
+        }
         let kernel = directory.appendingPathComponent(manifest.kernelName)
         let initramfs = directory.appendingPathComponent(manifest.initramfsName)
         guard FileManager.default.isReadableFile(atPath: kernel.path),
@@ -58,5 +61,13 @@ public enum GuestImageStore {
             return nil
         }
         return LoadedGuestImage(kernel: kernel, initramfs: initramfs, manifest: manifest)
+    }
+
+    static func isSafeImageName(_ name: String) -> Bool {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        return !name.isEmpty
+            && name == (name as NSString).lastPathComponent
+            && !name.hasPrefix(".")
+            && name.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 }

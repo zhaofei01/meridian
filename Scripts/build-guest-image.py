@@ -8,6 +8,7 @@ written into the image.
 
 import argparse
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -45,8 +46,9 @@ def curl_bytes(url):
 
 
 def cached(url, cache):
+    digest = hashlib.sha256(url.encode()).hexdigest()[:16]
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", url.rsplit("/", 1)[-1])
-    path = cache / name
+    path = cache / f"{digest}-{name}"
     if path.exists() and path.stat().st_size > 0:
         print(f"cache {path.name}", flush=True)
         return path
@@ -391,50 +393,62 @@ def main():
     cache = output / "cache"
     output.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
+    staging = output.parent / (output.name + ".staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
 
-    with tempfile.TemporaryDirectory(prefix="meridian-root-") as tmp:
-        root = Path(tmp)
-        print("extract minirootfs", flush=True)
-        extract_tar(latest_miniroot(cache), root)
-        indexes = []
-        for repo in ("main", "community"):
-            blob = cached(f"{ALPINE}/{repo}/aarch64/APKINDEX.tar.gz", cache).read_bytes()
-            indexes.extend(parse_index(blob, f"{ALPINE}/{repo}/aarch64"))
-        chosen = resolve(indexes)
-        print(f"packages {len(chosen)}", flush=True)
-        for package in chosen:
-            apk = cached(f"{package.repo}/{package.filename}", cache)
-            extract_apk(apk, root)
-        kernel_from(root, output)
-        node = install_node(root, cache)
-        has_claude = install_claude(root)
-        has_codex = install_codex(root, cache)
-        bundle_certificates(root)
-        agent = root / "usr/local/bin/meridian-agent"
-        agent.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(args.agent, agent)
-        agent.chmod(0o755)
-        init = root / "init"
-        shutil.copyfile(args.init, init)
-        init.chmod(0o755)
-        (root / "etc/hostname").write_text("meridian\n")
-        (root / "etc/hosts").write_text("127.0.0.1 localhost\n")
-        resolv = root / "etc/resolv.conf"
-        resolv.write_text("nameserver 127.0.0.1\n")
-        initramfs = output / "initramfs.img"
-        pack_initramfs(root, initramfs)
+    try:
+        with tempfile.TemporaryDirectory(prefix="meridian-root-") as tmp:
+            root = Path(tmp)
+            print("extract minirootfs", flush=True)
+            extract_tar(latest_miniroot(cache), root)
+            indexes = []
+            for repo in ("main", "community"):
+                blob = cached(f"{ALPINE}/{repo}/aarch64/APKINDEX.tar.gz", cache).read_bytes()
+                indexes.extend(parse_index(blob, f"{ALPINE}/{repo}/aarch64"))
+            chosen = resolve(indexes)
+            print(f"packages {len(chosen)}", flush=True)
+            for package in chosen:
+                apk = cached(f"{package.repo}/{package.filename}", cache)
+                extract_apk(apk, root)
+            kernel_from(root, staging)
+            node = install_node(root, cache)
+            has_claude = install_claude(root)
+            has_codex = install_codex(root, cache)
+            bundle_certificates(root)
+            agent = root / "usr/local/bin/meridian-agent"
+            agent.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(args.agent, agent)
+            agent.chmod(0o755)
+            init = root / "init"
+            shutil.copyfile(args.init, init)
+            init.chmod(0o755)
+            (root / "etc/hostname").write_text("meridian\n")
+            (root / "etc/hosts").write_text("127.0.0.1 localhost\n")
+            resolv = root / "etc/resolv.conf"
+            resolv.write_text("nameserver 127.0.0.1\n")
+            pack_initramfs(root, staging / "initramfs.img")
 
-    manifest = {
-        "hasClaude": has_claude,
-        "hasCodex": has_codex,
-        "hasNode": True,
-        "hasGit": True,
-        "builtAt": datetime.now(timezone.utc).isoformat(),
-        "kernelName": "kernel",
-        "initramfsName": "initramfs.img",
-        "note": f"Alpine latest-stable, Node {node}",
-    }
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        manifest = {
+            "hasClaude": has_claude,
+            "hasCodex": has_codex,
+            "hasNode": True,
+            "hasGit": True,
+            "builtAt": datetime.now(timezone.utc).isoformat(),
+            "kernelName": "kernel",
+            "initramfsName": "initramfs.img",
+            "note": f"Alpine latest-stable, Node {node}",
+        }
+        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        for name in ("kernel", "initramfs.img", "manifest.json"):
+            src = staging / name
+            dest = output / name
+            tmp = output / (name + ".new")
+            shutil.copy2(src, tmp)
+            tmp.replace(dest)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     print(f"image ready at {output}", flush=True)
 
 

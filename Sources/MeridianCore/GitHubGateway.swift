@@ -1,22 +1,35 @@
 import Foundation
 
+public enum AccessGrant: Equatable, Sendable {
+    case deny
+    case once
+    case session
+    case always
+}
+
 public final class GitHubGateway: @unchecked Sendable {
     public var token: () -> String?
-    public var authorize: (String) async -> Bool
+    public var authorize: (String) async -> AccessGrant
+    public var knownRepos: () -> Set<String>
+    public var persistRepo: (String) -> Void
     public var log: (String) -> Void
     private let session: URLSession
     private let lock = NSLock()
-    private var sessionAllowed = false
+    private var sessionRepos: Set<String> = []
 
     public init(
         session: URLSession = ModelGateway.makeSession(),
         token: @escaping () -> String?,
-        authorize: @escaping (String) async -> Bool = { _ in true },
+        authorize: @escaping (String) async -> AccessGrant,
+        knownRepos: @escaping () -> Set<String> = { [] },
+        persistRepo: @escaping (String) -> Void = { _ in },
         log: @escaping (String) -> Void = { _ in }
     ) {
         self.session = session
         self.token = token
         self.authorize = authorize
+        self.knownRepos = knownRepos
+        self.persistRepo = persistRepo
         self.log = log
     }
 
@@ -32,7 +45,7 @@ public final class GitHubGateway: @unchecked Sendable {
         defer { close() }
         do {
             guard let request = try HTTPCodec.readRequest(from: reader) else { return }
-            guard let upstream = GitHubRoutes.gitURL(target: request.target) else {
+            guard let upstream = GitHubRoutes.gitURL(target: request.target, method: request.method) else {
                 writer(HTTPCodec.response(status: 404, reason: "Not Found", body: Data("这个地址不是 GitHub 仓库。".utf8)))
                 return
             }
@@ -51,11 +64,7 @@ public final class GitHubGateway: @unchecked Sendable {
             var urlRequest = URLRequest(url: upstream)
             urlRequest.httpMethod = request.method
             urlRequest.httpBody = request.body
-            for (name, value) in request.headers {
-                let lower = name.lowercased()
-                if ["host", "authorization", "content-length", "connection", "accept-encoding"].contains(lower) {
-                    continue
-                }
+            for (name, value) in HTTPHeader.allowed(request.headers, names: HTTPHeader.gitForward) {
                 urlRequest.setValue(value, forHTTPHeaderField: name)
             }
             urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -67,7 +76,7 @@ public final class GitHubGateway: @unchecked Sendable {
             if let type = http?.value(forHTTPHeaderField: "Content-Type") {
                 headers.append(("Content-Type", type))
             }
-            writer(HTTPCodec.response(status: status, reason: "OK", headers: headers, body: data))
+            writer(HTTPCodec.response(status: status, reason: reason(status), headers: headers, body: data))
             log(Redaction.redact("使用已连接的 GitHub 访问 \(repo)。仓库密码没有进沙箱。", secrets: [token]))
         } catch {
             writer(HTTPCodec.response(status: 502, reason: "Bad Gateway", body: Data("转交 GitHub 失败。".utf8)))
@@ -75,18 +84,27 @@ public final class GitHubGateway: @unchecked Sendable {
         }
     }
 
-    private func ensureGitAccess(repo: String) async -> Bool {
+    func ensureGitAccess(repo: String) async -> Bool {
+        if knownRepos().contains(repo) { return true }
         lock.lock()
-        let already = sessionAllowed
+        let already = sessionRepos.contains(repo)
         lock.unlock()
         if already { return true }
-        let allowed = await authorize("它要使用你已连接的 GitHub，范围是 \(repo)。")
-        if allowed {
+        let grant = await authorize("它要使用你已连接的 GitHub，范围是 \(repo)。")
+        switch grant {
+        case .deny:
+            return false
+        case .once:
+            return true
+        case .session:
             lock.lock()
-            sessionAllowed = true
+            sessionRepos.insert(repo)
             lock.unlock()
+            return true
+        case .always:
+            persistRepo(repo)
+            return true
         }
-        return allowed
     }
 
     private func handleMCP(reader: BufferReader, writer: @escaping (Data) -> Void, close: @escaping () -> Void) async {
@@ -100,6 +118,16 @@ public final class GitHubGateway: @unchecked Sendable {
             guard request.method == "POST" else {
                 writer(HTTPCodec.response(status: 405, reason: "Method Not Allowed"))
                 return
+            }
+            let message = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any]
+            if message?["method"] as? String == "tools/call" {
+                let repo = MCPExchange.scope(message: message ?? [:])
+                let allowed = await ensureGitAccess(repo: repo)
+                guard allowed else {
+                    writer(HTTPCodec.response(status: 403, reason: "Forbidden", body: Data("这次没有允许使用 GitHub。".utf8)))
+                    log("拒绝使用 GitHub 工具，范围是 \(repo)。")
+                    return
+                }
             }
             let token = token()
             let payload = try await MCPExchange.respond(body: request.body, token: token, session: session)
@@ -126,15 +154,39 @@ public final class GitHubGateway: @unchecked Sendable {
             writer(HTTPCodec.response(status: 400, reason: "Bad Request", body: Data("GitHub 工具没有完成。".utf8)))
         }
     }
+
+    private func reason(_ status: Int) -> String {
+        switch status {
+        case 200: return "OK"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        default: return "Status"
+        }
+    }
 }
 
 enum MCPExchange {
+    static func scope(message: [String: Any]) -> String {
+        let params = message["params"] as? [String: Any]
+        let name = params?["name"] as? String ?? ""
+        let args = params?["arguments"] as? [String: Any] ?? [:]
+        if name == "github_list_issues" {
+            let owner = args["owner"] as? String ?? ""
+            let repo = args["repo"] as? String ?? ""
+            if GitHubName.isName(owner), GitHubName.isName(repo) {
+                return "\(owner)/\(repo)"
+            }
+        }
+        return "GitHub 账号"
+    }
+
     static func respond(body: Data, token: String?, session: URLSession) async throws -> Data {
         let message = try JSONSerialization.jsonObject(with: body) as? [String: Any]
         let method = message?["method"] as? String ?? ""
         let id = message?["id"]
         if method == "notifications/initialized" || id == nil {
-            return Data("{}".utf8)
+            return Data("{\"jsonrpc\":\"2.0\"}".utf8)
         }
         let result: Any
         switch method {
@@ -204,7 +256,7 @@ enum MCPExchange {
         case "github_list_issues":
             let owner = args["owner"] as? String ?? ""
             let repo = args["repo"] as? String ?? ""
-            guard isName(owner), isName(repo) else {
+            guard GitHubName.isName(owner), GitHubName.isName(repo) else {
                 return toolText("仓库名不合规则。", error: true)
             }
             let json = try await get(path: "/repos/\(owner)/\(repo)/issues?per_page=20", token: token, session: session)
@@ -239,12 +291,5 @@ enum MCPExchange {
             "content": [["type": "text", "text": text]],
             "isError": error,
         ]
-    }
-
-    private static func isName(_ value: String) -> Bool {
-        guard !value.isEmpty, value.count < 120 else { return false }
-        return value.unicodeScalars.allSatisfy { scalar in
-            CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_" || scalar == "."
-        }
     }
 }
